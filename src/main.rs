@@ -1,30 +1,48 @@
-use futures::future::join_all;
-use futures_util::StreamExt;
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::default::Default;
 use std::env;
 use std::fs;
 use std::fs::File;
 use std::io::prelude::*;
-use wkhtmltopdf::{Orientation, PdfApplication, Size};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use headless_chrome::browser::tab::EventListener;
+use headless_chrome::protocol::page::ScreenshotFormat;
+use headless_chrome::protocol::Event;
+use headless_chrome::protocol::Event::Lifecycle;
+use headless_chrome::{Browser, LaunchOptionsBuilder};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+const ARTICLE_ROOT_DIV_CLASS: &str = ".sc-1vjtieq-0";
+const WAIT_AFTER_LAST_IDLE_MS: u128 = 1000;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let username =
         env::var("CREATOR_ID").expect("Set your creator ID to environment variable CREATOR_ID");
-    let to_id = env::var("TO_ID").unwrap_or("".to_owned());
+    let to_id = env::var("TO_ID").unwrap_or("0".to_owned()).parse::<u32>()?;
+    let from_id = env::var("FROM_ID")
+        .unwrap_or("10000000000".to_owned())
+        .parse::<u32>()?;
     let start_url = format!(
         "https://api.fanbox.cc/post.listCreator?creatorId={}&limit=10",
         username
     );
     let client = reqwest::Client::new();
-    let mut pdf_app = PdfApplication::new().expect("Failed to init PDF application");
     let mut url = start_url.to_owned();
+    let launch_options = LaunchOptionsBuilder::default()
+        .window_size(Some((1024, 1024 * 1024)))
+        .build()
+        .unwrap();
+    let browser = Browser::new(launch_options)?;
+    let _ = browser.wait_for_initial_tab()?;
 
     loop {
-        let (_pdf_app, ret) = process_page(&username, &to_id, &url, &client, pdf_app).await?;
-        pdf_app = _pdf_app;
+        let ret = process_page(&username, to_id, from_id, &url, &client, &browser).await?;
         match ret {
             Some(next) => url = next,
             None => return Ok(()),
@@ -34,11 +52,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn process_page(
     username: &String,
-    to_id: &String,
+    to_id: u32,
+    from_id: u32,
     url: &String,
     client: &Client,
-    mut pdf_app: PdfApplication,
-) -> Result<(PdfApplication, Option<String>), Box<dyn std::error::Error>> {
+    browser: &Browser,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let origin = format!("https://{}.fanbox.cc", username);
     let res = client.get(url).header("Origin", origin).send().await?;
 
@@ -49,13 +68,18 @@ async fn process_page(
 
     if root.body.items.len() == 0 {
         println!("No more items. Finish");
-        return Ok((pdf_app, None));
+        return Ok(None);
     }
 
     for item in &root.body.items {
-        if item.id == *to_id {
+        let id = item.id.parse::<u32>()?;
+        if id <= to_id {
             println!("Reach end ID {}. Finish", item.id);
-            return Ok((pdf_app, None));
+            return Ok(None);
+        }
+        if id > from_id {
+            println!("Skipping ID {}", item.id);
+            continue;
         }
         if let Some(body) = &item.body {
             let dir = format!("out/{}", item.id);
@@ -67,29 +91,7 @@ async fn process_page(
                 body_html = txt.to_owned();
             }
 
-            async fn download(
-                client: &Client,
-                id: &String,
-                data: &ImageMapValue,
-                dir: &String,
-            ) -> Result<(), Box<dyn std::error::Error>> {
-                let res = client.get(&data.original_url).send().await?;
-                let fname = format!("{}/{}.{}", dir, id, data.extension);
-                let mut dest = File::create(&fname)?;
-                let mut stream = res.bytes_stream();
-
-                while let Some(item) = stream.next().await {
-                    dest.write_all(&item?)?;
-                }
-                Ok(())
-            }
-
-            join_all(
-                body.image_map
-                    .iter()
-                    .map(|(id, data)| download(client, id, data, &dir)),
-            )
-            .await;
+            let fanbox_url = format!("https://{}.fanbox.cc/posts/{}", username, item.id);
 
             if let Some(blocks) = &body.blocks {
                 for block in blocks {
@@ -121,28 +123,89 @@ async fn process_page(
                 item.id, item.title, item.published_datetime, item.updated_datetime, body_html
             );
 
-            let fname = format!("{}/index.html", dir);
+            let fname = format!("{}/{}.html", dir, title);
             let mut dest = File::create(&fname)?;
             dest.write_all(html.as_bytes())?;
 
-            let mut pdfout = pdf_app
-                .builder()
-                .orientation(Orientation::Portrait)
-                .margin(Size::Inches(1))
-                .title(&title)
-                .build_from_path(&fname)
-                .expect("failed to build pdf");
+            let pdf_name = format!("{}/{}", dir, title);
+            let file_size = save_article(browser, fanbox_url, pdf_name)?;
 
-            let filename = format!("{}/{}.pdf", dir, title);
-            pdfout.save(filename).expect("failed to save pdf");
-
-            println!("Output {}", title);
+            println!("Output {} (pdf size: {})", title, file_size);
         } else {
             println!("Skipping empty body. ID {}", item.id);
         }
     }
 
-    Ok((pdf_app, root.body.next_url))
+    Ok(root.body.next_url)
+}
+
+struct EventHandler {
+    start_time: Instant,
+    last_network_idle_ms: AtomicU64,
+}
+
+impl EventHandler {
+    fn is_idle(&self) -> bool {
+        let now = Instant::now();
+        return match self.last_network_idle_ms.load(Ordering::Relaxed) {
+            0 => false,
+            v => {
+                now.duration_since(self.start_time).as_millis() - v as u128
+                    > WAIT_AFTER_LAST_IDLE_MS
+            }
+        };
+    }
+}
+
+impl EventListener<Event> for EventHandler {
+    fn on_event(&self, event: &Event) -> () {
+        match event {
+            Lifecycle(l) => {
+                if l.params.name == "networkIdle" {
+                    self.last_network_idle_ms.fetch_max(
+                        Instant::now().duration_since(self.start_time).as_millis() as u64,
+                        Ordering::SeqCst,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn save_article(
+    browser: &Browser,
+    url: String,
+    filename: String,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let tab = browser.new_tab()?;
+    let handler = Arc::new(EventHandler {
+        start_time: Instant::now(),
+        last_network_idle_ms: AtomicU64::new(0),
+    });
+    tab.add_event_listener(handler.clone())?;
+    tab.navigate_to(&url)?;
+    tab.wait_until_navigated()?;
+
+    while !handler.is_idle() {
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let viewport = tab
+        .wait_for_element(ARTICLE_ROOT_DIV_CLASS)?
+        .get_box_model()?
+        .margin_viewport();
+    let jpg = tab.capture_screenshot(ScreenshotFormat::JPEG(None), Some(viewport), true)?;
+    let mut jpg_file = File::create(&format!("{}.jpg", filename))?;
+    if jpg.is_empty() {
+        println!("Could not generate jpg");
+    } else {
+        jpg_file.write_all(&jpg)?;
+    }
+    let pdf = tab.print_to_pdf(None)?;
+    let mut pdf_file = File::create(&format!("{}.pdf", filename))?;
+    pdf_file.write_all(&pdf)?;
+    Ok(pdf.len())
 }
 
 #[derive(Serialize, Deserialize, Debug)]
