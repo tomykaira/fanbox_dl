@@ -1,13 +1,12 @@
-use futures::future::join_all;
-use futures_util::StreamExt;
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::fs::File;
 use std::io::prelude::*;
-use wkhtmltopdf::{Orientation, PdfApplication, Size};
+
+use headless_chrome::{Browser};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,12 +18,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         username
     );
     let client = reqwest::Client::new();
-    let mut pdf_app = PdfApplication::new().expect("Failed to init PDF application");
     let mut url = start_url.to_owned();
+    let browser = Browser::default()?;
+    let _ = browser.wait_for_initial_tab()?;
 
     loop {
-        let (_pdf_app, ret) = process_page(&username, &to_id, &url, &client, pdf_app).await?;
-        pdf_app = _pdf_app;
+        let ret = process_page(&username, &to_id, &url, &client, &browser).await?;
         match ret {
             Some(next) => url = next,
             None => return Ok(()),
@@ -37,8 +36,8 @@ async fn process_page(
     to_id: &String,
     url: &String,
     client: &Client,
-    mut pdf_app: PdfApplication,
-) -> Result<(PdfApplication, Option<String>), Box<dyn std::error::Error>> {
+    browser: &Browser,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let origin = format!("https://{}.fanbox.cc", username);
     let res = client.get(url).header("Origin", origin).send().await?;
 
@@ -49,13 +48,13 @@ async fn process_page(
 
     if root.body.items.len() == 0 {
         println!("No more items. Finish");
-        return Ok((pdf_app, None));
+        return Ok(None);
     }
 
     for item in &root.body.items {
         if item.id == *to_id {
             println!("Reach end ID {}. Finish", item.id);
-            return Ok((pdf_app, None));
+            return Ok(None);
         }
         if let Some(body) = &item.body {
             let dir = format!("out/{}", item.id);
@@ -67,29 +66,7 @@ async fn process_page(
                 body_html = txt.to_owned();
             }
 
-            async fn download(
-                client: &Client,
-                id: &String,
-                data: &ImageMapValue,
-                dir: &String,
-            ) -> Result<(), Box<dyn std::error::Error>> {
-                let res = client.get(&data.original_url).send().await?;
-                let fname = format!("{}/{}.{}", dir, id, data.extension);
-                let mut dest = File::create(&fname)?;
-                let mut stream = res.bytes_stream();
-
-                while let Some(item) = stream.next().await {
-                    dest.write_all(&item?)?;
-                }
-                Ok(())
-            }
-
-            join_all(
-                body.image_map
-                    .iter()
-                    .map(|(id, data)| download(client, id, data, &dir)),
-            )
-            .await;
+            let fanbox_url = format!("https://{}.fanbox.cc/posts/{}", username, item.id);
 
             if let Some(blocks) = &body.blocks {
                 for block in blocks {
@@ -125,24 +102,27 @@ async fn process_page(
             let mut dest = File::create(&fname)?;
             dest.write_all(html.as_bytes())?;
 
-            let mut pdfout = pdf_app
-                .builder()
-                .orientation(Orientation::Portrait)
-                .margin(Size::Inches(1))
-                .title(&title)
-                .build_from_path(&fname)
-                .expect("failed to build pdf");
+            let pdf_name = format!("{}/{}.pdf", dir, title);
+            let file_size = save_article(browser, fanbox_url, pdf_name)?;
 
-            let filename = format!("{}/{}.pdf", dir, title);
-            pdfout.save(filename).expect("failed to save pdf");
-
-            println!("Output {}", title);
+            println!("Output {} (pdf size: {})", title, file_size);
         } else {
             println!("Skipping empty body. ID {}", item.id);
         }
     }
 
-    Ok((pdf_app, root.body.next_url))
+    Ok(root.body.next_url)
+}
+
+
+fn save_article(browser: &Browser, url: String, filename: String) -> Result<usize, Box<dyn std::error::Error>> {
+    let tab = browser.new_tab()?;
+    tab.navigate_to(&url)?;
+    tab.wait_until_navigated()?;
+    let data = tab.print_to_pdf( None )?;
+    let mut dest = File::create(&filename)?;
+    dest.write_all(&data)?;
+    Ok(data.len())
 }
 
 #[derive(Serialize, Deserialize, Debug)]
